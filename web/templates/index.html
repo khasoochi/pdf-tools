@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart PDF Compressor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Smart PDF Compressor</h1>
+            <p class="subtitle">Compress PDFs to your target size while preserving maximum clarity</p>
+        </header>
+
+        <!-- Step 1: Upload -->
+        <section id="upload-section" class="card">
+            <h2>1. Upload PDF</h2>
+            <div id="drop-zone" class="drop-zone">
+                <div class="drop-zone-content">
+                    <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    <p>Drag & drop your PDF here</p>
+                    <p class="or">or</p>
+                    <button id="browse-btn" class="btn btn-secondary">Browse Files</button>
+                    <input type="file" id="file-input" accept=".pdf" hidden>
+                </div>
+            </div>
+            <div id="upload-progress" class="progress-container" hidden>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="upload-fill"></div>
+                </div>
+                <p class="progress-text">Uploading...</p>
+            </div>
+        </section>
+
+        <!-- Step 2: Analysis Results -->
+        <section id="analysis-section" class="card" hidden>
+            <h2>2. PDF Analysis</h2>
+            <div class="analysis-grid">
+                <div class="stat-card">
+                    <span class="stat-label">Current Size</span>
+                    <span class="stat-value" id="current-size">-</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Pages</span>
+                    <span class="stat-value" id="page-count">-</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Image Content</span>
+                    <span class="stat-value" id="image-percentage">-</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Text Detected</span>
+                    <span class="stat-value" id="text-detected">-</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">PDF Type</span>
+                    <span class="stat-value" id="pdf-type">-</span>
+                </div>
+                <div class="stat-card highlight">
+                    <span class="stat-label">Estimated Achievable Size</span>
+                    <span class="stat-value" id="estimated-size">-</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Step 3: Compression Options -->
+        <section id="options-section" class="card" hidden>
+            <h2>3. Compression Settings</h2>
+
+            <div class="form-group">
+                <label for="target-size">Target Size</label>
+                <div class="input-with-unit">
+                    <input type="number" id="target-size-value" min="1" step="0.1" value="5">
+                    <select id="target-size-unit">
+                        <option value="KB">KB</option>
+                        <option value="MB" selected>MB</option>
+                    </select>
+                </div>
+                <p class="help-text" id="size-hint"></p>
+            </div>
+
+            <div class="form-group">
+                <label for="tolerance">Quality Mode</label>
+                <div class="radio-group">
+                    <label class="radio-option">
+                        <input type="radio" name="tolerance" value="strict">
+                        <span class="radio-label">
+                            <strong>Strict Size</strong>
+                            <small>May reduce image sharpness to meet target</small>
+                        </span>
+                    </label>
+                    <label class="radio-option">
+                        <input type="radio" name="tolerance" value="balanced" checked>
+                        <span class="radio-label">
+                            <strong>Balanced</strong>
+                            <small>Best balance between size and quality</small>
+                        </span>
+                    </label>
+                    <label class="radio-option">
+                        <input type="radio" name="tolerance" value="high_clarity">
+                        <span class="radio-label">
+                            <strong>High Clarity</strong>
+                            <small>Prioritize quality, may exceed target slightly</small>
+                        </span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="form-group" id="text-options" hidden>
+                <label>Text Options</label>
+                <div class="checkbox-group">
+                    <label class="checkbox-option">
+                        <input type="checkbox" id="extract-text">
+                        <span>Extract text to separate file</span>
+                    </label>
+                    <label class="checkbox-option">
+                        <input type="checkbox" id="remove-text">
+                        <span>Remove text layer from PDF</span>
+                    </label>
+                </div>
+            </div>
+
+            <button id="compress-btn" class="btn btn-primary btn-large">
+                Start Compression
+            </button>
+        </section>
+
+        <!-- Step 4: Progress -->
+        <section id="progress-section" class="card" hidden>
+            <h2>4. Compressing...</h2>
+            <div class="compression-progress">
+                <div class="stage-indicator">
+                    <div class="stage" data-stage="1">
+                        <div class="stage-dot"></div>
+                        <span>Analyzing PDF</span>
+                    </div>
+                    <div class="stage" data-stage="2">
+                        <div class="stage-dot"></div>
+                        <span>Processing images</span>
+                    </div>
+                    <div class="stage" data-stage="3">
+                        <div class="stage-dot"></div>
+                        <span>Optimizing objects</span>
+                    </div>
+                    <div class="stage" data-stage="4">
+                        <div class="stage-dot"></div>
+                        <span>Text extraction</span>
+                    </div>
+                    <div class="stage" data-stage="5">
+                        <div class="stage-dot"></div>
+                        <span>Finalizing PDF</span>
+                    </div>
+                </div>
+                <div class="progress-bar large">
+                    <div class="progress-fill" id="compress-fill"></div>
+                </div>
+                <p class="progress-text" id="progress-text">Starting...</p>
+            </div>
+        </section>
+
+        <!-- Step 5: Results -->
+        <section id="results-section" class="card" hidden>
+            <h2>5. Compression Complete!</h2>
+            <div class="results-grid">
+                <div class="result-card">
+                    <span class="result-label">Original Size</span>
+                    <span class="result-value" id="result-original">-</span>
+                </div>
+                <div class="result-card success">
+                    <span class="result-label">Compressed Size</span>
+                    <span class="result-value" id="result-compressed">-</span>
+                </div>
+                <div class="result-card">
+                    <span class="result-label">Reduction</span>
+                    <span class="result-value" id="result-reduction">-</span>
+                </div>
+                <div class="result-card">
+                    <span class="result-label">Quality</span>
+                    <span class="result-value" id="result-quality">-</span>
+                </div>
+                <div class="result-card">
+                    <span class="result-label">Target Achieved</span>
+                    <span class="result-value" id="result-target">-</span>
+                </div>
+            </div>
+
+            <div class="download-section">
+                <h3>Download Files</h3>
+                <div id="download-buttons" class="download-buttons">
+                    <!-- Buttons inserted by JS -->
+                </div>
+            </div>
+
+            <button id="start-over-btn" class="btn btn-secondary">
+                Compress Another PDF
+            </button>
+        </section>
+
+        <!-- Error Display -->
+        <section id="error-section" class="card error-card" hidden>
+            <h2>Error</h2>
+            <p id="error-message"></p>
+            <button id="error-retry-btn" class="btn btn-secondary">Try Again</button>
+        </section>
+    </div>
+
+    <footer>
+        <p>Smart PDF Compressor - Local-first PDF optimization</p>
+        <p class="privacy-note">All processing happens locally. No files are uploaded to external servers.</p>
+    </footer>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
