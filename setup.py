@@ -20,7 +20,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "pdfcompress=cli:main",
+            "pdfcompress=pdfcompress.cli:main",
         ],
     },
     classifiers=[
