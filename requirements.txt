@@ -1,0 +1,22 @@
+# Smart PDF Compressor - Dependencies
+
+# PDF Processing
+PyMuPDF>=1.23.0          # fitz - fast PDF manipulation
+pikepdf>=8.0.0           # PDF structure optimization
+pypdf>=3.0.0             # Additional PDF utilities
+
+# Image Processing
+Pillow>=10.0.0           # Image manipulation and compression
+
+# CLI
+click>=8.1.0             # CLI framework
+rich>=13.0.0             # Progress bars and rich output
+tqdm>=4.65.0             # Progress bar alternative
+
+# Web App
+Flask>=3.0.0             # Web framework
+Flask-CORS>=4.0.0        # Cross-origin support
+Werkzeug>=3.0.0          # WSGI utilities
+
+# Utilities
+humanize>=4.8.0          # Human-readable file sizes
