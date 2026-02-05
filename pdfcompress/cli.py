@@ -28,8 +28,10 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from pdfcompress import PDFAnalyzer, PDFCompressor, TextHandler
-from pdfcompress.utils import format_size, get_output_path, parse_size
+from .analyzer import PDFAnalyzer
+from .compressor import PDFCompressor
+from .text_handler import TextHandler
+from .utils import format_size, get_output_path, parse_size
 
 console = Console()
 
