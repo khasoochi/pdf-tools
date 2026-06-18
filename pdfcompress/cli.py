@@ -57,10 +57,10 @@ def cli(ctx):
 
 
 @cli.command()
-@click.argument("input_file", type=click.Path(exists=True))
+@click.argument("input_file", type=click.Path(exists=True), required=False)
 @click.option(
     "--target", "-t",
-    required=True,
+    required=False,
     help="Target file size (e.g., 5MB, 800KB, 1.5GB)",
 )
 @click.option(
@@ -94,6 +94,17 @@ def cli(ctx):
     is_flag=True,
     help="Output results as JSON",
 )
+@click.option(
+    "--engine",
+    type=click.Choice(["auto", "ghostscript", "pymupdf"]),
+    default="auto",
+    help="Compression engine: auto (default), ghostscript (fast), pymupdf (no external deps)",
+)
+@click.option(
+    "--show-engines",
+    is_flag=True,
+    help="Show available compression engines and exit",
+)
 def compress(
     input_file: str,
     target: str,
@@ -103,8 +114,20 @@ def compress(
     remove_text: bool,
     verbose: bool,
     json_output: bool,
+    engine: str,
+    show_engines: bool,
 ):
     """Compress a PDF file to a target size."""
+    # Handle --show-engines flag
+    if show_engines:
+        _show_available_engines()
+        return
+
+    # Validate required arguments when not showing engines
+    if not input_file:
+        raise click.UsageError("Missing argument 'INPUT_FILE'.")
+    if not target:
+        raise click.UsageError("Missing option '--target' / '-t'.")
     input_path = Path(input_file)
     target_bytes = parse_size(target)
     output_path = get_output_path(input_path, output)
@@ -121,22 +144,26 @@ def compress(
 
     # Progress callback for non-JSON output
     current_task = [None]
+    progress_bar = [None]
 
     def progress_callback(stage: str, percentage: int):
-        if not json_output and current_task[0]:
-            current_task[0].update(description=stage, completed=percentage)
+        if not json_output and current_task[0] is not None and progress_bar[0]:
+            progress_bar[0].update(current_task[0], description=stage, completed=percentage)
 
     with create_progress_bar() as progress:
         if not json_output:
             task = progress.add_task("Initializing...", total=100)
-            current_task[0] = progress.tasks[task]
+            current_task[0] = task
+            progress_bar[0] = progress
 
-        # Create compressor
+        # Create compressor with engine preference
+        prefer_engine = None if engine == "auto" else engine
         compressor = PDFCompressor(
             input_path,
             target_bytes,
             tolerance=tolerance,
             progress_callback=progress_callback if not json_output else None,
+            prefer_engine=prefer_engine,
         )
 
         # Run compression
@@ -182,6 +209,7 @@ def compress(
         table.add_row("Target Size", format_size(result.target_size))
         table.add_row("Target Achieved", "Yes" if result.target_achieved else "No")
         table.add_row("Quality", result.quality_estimate)
+        table.add_row("Engine Used", result.engine_used)
         table.add_row("Pages Processed", str(result.pages_processed))
         table.add_row("Images Processed", str(result.images_processed))
 
@@ -374,6 +402,42 @@ def remove_text_cmd(input_file: str, output: Optional[str]):
     else:
         console.print(f"[red]Error: {result.error}[/red]")
         sys.exit(1)
+
+
+def _show_available_engines():
+    """Display available compression engines."""
+    engines = PDFCompressor.get_available_engines()
+
+    table = Table(title="Available Compression Engines")
+    table.add_column("Engine", style="cyan")
+    table.add_column("Available", style="green")
+    table.add_column("Description")
+
+    table.add_row(
+        "ghostscript",
+        "[green]Yes[/green]" if engines["ghostscript"]["available"] else "[red]No[/red]",
+        engines["ghostscript"]["description"]
+    )
+
+    table.add_row(
+        "pymupdf_optimized",
+        "[green]Yes[/green]" if engines["pymupdf_optimized"]["available"] else "[red]No[/red]",
+        engines["pymupdf_optimized"]["description"]
+    )
+
+    table.add_row(
+        "pikepdf",
+        "[green]Yes[/green]" if engines["pikepdf"]["available"] else "[red]No[/red]",
+        engines["pikepdf"]["description"]
+    )
+
+    console.print(table)
+
+    if not engines["ghostscript"]["available"]:
+        console.print("\n[yellow]Tip: Install Ghostscript for faster compression:[/yellow]")
+        console.print("  Windows: https://ghostscript.com/releases/gsdnld.html")
+        console.print("  macOS: brew install ghostscript")
+        console.print("  Linux: sudo apt install ghostscript")
 
 
 def main():

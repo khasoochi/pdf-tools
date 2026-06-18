@@ -5,13 +5,12 @@ Smart PDF Compressor - Flask Web Application
 A local web interface for PDF compression with real-time progress tracking.
 """
 
-import json
 import os
-import shutil
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -21,7 +20,6 @@ from flask import (
     render_template,
     request,
     send_file,
-    session,
 )
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -34,31 +32,79 @@ from pdfcompress import PDFAnalyzer, PDFCompressor, TextHandler
 from pdfcompress.utils import format_size, parse_size
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
-CORS(app)
+# Use a stable secret from the environment in production; fall back to a random
+# one for local dev (sessions won't survive a restart, which is fine locally).
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(24)
+
+# Restrict CORS to the app's own origin. The UI is served from the same origin,
+# so no wildcard cross-origin access is needed.
+CORS(app, origins=["http://127.0.0.1:5000", "http://localhost:5000"])
 
 # Configuration
 UPLOAD_FOLDER = Path(tempfile.gettempdir()) / "pdfcompress_uploads"
 OUTPUT_FOLDER = Path(tempfile.gettempdir()) / "pdfcompress_output"
 ALLOWED_EXTENSIONS = {"pdf"}
-MAX_CONTENT_LENGTH = 500 * 1024 * 1024  # 500MB max upload
+# Max upload size (override with PDFCOMPRESS_MAX_UPLOAD_MB). Smaller is safer:
+# it limits the blast radius of decompression-bomb PDFs.
+MAX_UPLOAD_MB = int(os.environ.get("PDFCOMPRESS_MAX_UPLOAD_MB", "200"))
+MAX_CONTENT_LENGTH = MAX_UPLOAD_MB * 1024 * 1024
+# Cap concurrent compression jobs so a flood of requests can't exhaust the box.
+MAX_CONCURRENT_JOBS = int(os.environ.get("PDFCOMPRESS_MAX_JOBS", "2"))
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["OUTPUT_FOLDER"] = OUTPUT_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
-# Create folders
+# Create folders with restrictive permissions (best effort; no-op on Windows).
 UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+for _folder in (UPLOAD_FOLDER, OUTPUT_FOLDER):
+    try:
+        os.chmod(_folder, 0o700)
+    except OSError:
+        pass
 
 # Job tracking
 jobs: Dict[str, dict] = {}
 jobs_lock = threading.Lock()
+# Bounded worker pool: backs the compression jobs instead of unbounded threads.
+executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS)
 
 
 def allowed_file(filename: str) -> bool:
     """Check if file extension is allowed."""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def is_pdf(file_path: Path) -> bool:
+    """Verify the file actually starts with the PDF magic bytes."""
+    try:
+        with open(file_path, "rb") as fh:
+            return fh.read(5) == b"%PDF-"
+    except OSError:
+        return False
+
+
+def resolve_upload_path(file_id: str, filename: str) -> Optional[Path]:
+    """Safely resolve an uploaded file path, guarding against path traversal.
+
+    Returns the resolved path if (and only if) ``file_id`` is a UUID we issued
+    and the final path stays inside UPLOAD_FOLDER. Returns None otherwise.
+    """
+    try:
+        uuid.UUID(str(file_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+    safe_name = secure_filename(filename or "")
+    if not safe_name:
+        return None
+
+    upload_root = UPLOAD_FOLDER.resolve()
+    candidate = (upload_root / f"{file_id}_{safe_name}").resolve()
+    if upload_root not in candidate.parents:
+        return None
+    return candidate
 
 
 def cleanup_old_files(max_age_hours: int = 1):
@@ -106,6 +152,12 @@ def upload_file():
 
     file.save(file_path)
 
+    # Defense in depth: reject anything that isn't actually a PDF, regardless
+    # of its extension.
+    if not is_pdf(file_path):
+        file_path.unlink(missing_ok=True)
+        return jsonify({"error": "Not a valid PDF file"}), 400
+
     # Analyze the PDF
     try:
         analyzer = PDFAnalyzer(file_path)
@@ -133,8 +185,9 @@ def upload_file():
             }
         })
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        app.logger.exception("Upload analysis failed")
+        return jsonify({"error": "Failed to analyze PDF"}), 500
 
 
 @app.route("/api/compress", methods=["POST"])
@@ -146,7 +199,7 @@ def start_compression():
         return jsonify({"error": "No data provided"}), 400
 
     file_id = data.get("file_id")
-    filename = data.get("filename")
+    filename = secure_filename(data.get("filename") or "")
     target_size_str = data.get("target_size")
     tolerance = data.get("tolerance", "balanced")
     extract_text = data.get("extract_text", False)
@@ -155,8 +208,11 @@ def start_compression():
     if not all([file_id, filename, target_size_str]):
         return jsonify({"error": "Missing required fields"}), 400
 
-    # Find the uploaded file
-    file_path = UPLOAD_FOLDER / f"{file_id}_{filename}"
+    # Find the uploaded file, guarding against path traversal: file_id must be a
+    # UUID we issued and the resolved path must stay inside UPLOAD_FOLDER.
+    file_path = resolve_upload_path(file_id, filename)
+    if file_path is None:
+        return jsonify({"error": "Invalid file reference"}), 400
     if not file_path.exists():
         return jsonify({"error": "File not found. Please upload again."}), 404
 
@@ -182,12 +238,11 @@ def start_compression():
             "output_files": {},
         }
 
-    # Start compression in background thread
-    thread = threading.Thread(
-        target=run_compression_job,
-        args=(job_id, file_path, target_bytes, tolerance, extract_text, remove_text),
+    # Submit to the bounded worker pool (caps concurrent compressions).
+    executor.submit(
+        run_compression_job,
+        job_id, file_path, target_bytes, tolerance, extract_text, remove_text,
     )
-    thread.start()
 
     return jsonify({"job_id": job_id})
 
@@ -253,11 +308,12 @@ def run_compression_job(
             if not result.success:
                 jobs[job_id]["error"] = result.error
 
-    except Exception as e:
+    except Exception:
+        app.logger.exception("Compression job %s failed", job_id)
         with jobs_lock:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["stage"] = "Error"
-            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["error"] = "Compression failed"
 
 
 @app.route("/api/job/<job_id>")
@@ -326,6 +382,13 @@ def get_report(job_id: str):
 
 
 if __name__ == "__main__":
+    # Bind to loopback by default and keep the debugger off — the Werkzeug
+    # debugger is a remote-code-execution risk if exposed. Override only for
+    # trusted local dev via env vars.
+    host = os.environ.get("PDFCOMPRESS_HOST", "127.0.0.1")
+    port = int(os.environ.get("PDFCOMPRESS_PORT", "5000"))
+    debug = os.environ.get("PDFCOMPRESS_DEBUG", "").lower() in ("1", "true", "yes")
+
     print("Starting Smart PDF Compressor Web Server...")
-    print("Open http://localhost:5000 in your browser")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    print(f"Open http://{host}:{port} in your browser")
+    app.run(debug=debug, host=host, port=port)

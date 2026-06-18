@@ -1,16 +1,16 @@
 """PDF Compression engine for Smart PDF Compressor."""
 
-import io
+import shutil
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple, Union
-
-import fitz  # PyMuPDF
-from PIL import Image
+from typing import Callable, Optional, Union
 
 from .analyzer import AnalysisResult, PDFAnalyzer
+from .engines import EngineResult
+from .engines.ghostscript import GhostscriptEngine
+from .engines.pikepdf_engine import PikepdfEngine
+from .engines.pymupdf_optimized import OptimizedPyMuPDFEngine
 from .utils import calculate_compression_ratio, estimate_quality_score, format_size
 
 
@@ -29,6 +29,7 @@ class CompressionResult:
     target_size: int
     target_achieved: bool
     iterations: int = 1
+    engine_used: str = "auto"
     error: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -49,6 +50,7 @@ class CompressionResult:
             "target_size_formatted": format_size(self.target_size),
             "target_achieved": self.target_achieved,
             "iterations": self.iterations,
+            "engine_used": self.engine_used,
             "error": self.error,
         }
 
@@ -63,21 +65,19 @@ class CompressionStage:
 
 class PDFCompressor:
     """
-    PDF compression engine with iterative optimization.
+    PDF compression engine with hybrid multi-engine approach.
 
-    Compresses PDFs to a target size while preserving maximum quality.
-    Uses progressive optimization techniques including:
-    - Image downscaling (adaptive DPI)
-    - JPEG recompression with quality tuning
-    - Metadata removal
-    - Object deduplication
+    Compression strategy:
+    1. Try Ghostscript first (fastest, best compression) if available
+    2. If unavailable or target not met, use optimized PyMuPDF
+    3. Post-process with pikepdf for additional optimization
+
+    Features:
+    - Automatic engine selection based on availability
+    - Image caching and parallel processing (PyMuPDF engine)
+    - Binary search for optimal quality settings
+    - Fallback chain for maximum compatibility
     """
-
-    # Quality levels for iterative compression
-    QUALITY_LEVELS = [95, 85, 75, 65, 55, 45, 35, 25]
-
-    # DPI levels for image downscaling
-    DPI_LEVELS = [300, 200, 150, 120, 100, 72]
 
     def __init__(
         self,
@@ -85,6 +85,7 @@ class PDFCompressor:
         target_size: int,
         tolerance: str = "balanced",
         progress_callback: Optional[Callable[[str, int], None]] = None,
+        prefer_engine: Optional[str] = None,
     ):
         """
         Initialize compressor.
@@ -94,18 +95,18 @@ class PDFCompressor:
             target_size: Target size in bytes
             tolerance: "strict", "balanced", or "high_clarity"
             progress_callback: Optional callback for progress updates (stage, percentage)
+            prefer_engine: Engine preference - "auto", "ghostscript", or "pymupdf"
         """
         self.pdf_path = Path(pdf_path)
         self.target_size = target_size
         self.tolerance = tolerance
         self.progress_callback = progress_callback
+        self.prefer_engine = prefer_engine or "auto"
 
-        # Tolerance affects how aggressively we compress
-        self.tolerance_config = {
-            "strict": {"max_iterations": 10, "min_quality": 25, "min_dpi": 72},
-            "balanced": {"max_iterations": 6, "min_quality": 45, "min_dpi": 100},
-            "high_clarity": {"max_iterations": 4, "min_quality": 65, "min_dpi": 150},
-        }
+        # Initialize engines
+        self._gs_engine = GhostscriptEngine()
+        self._pymupdf_engine = OptimizedPyMuPDFEngine()
+        self._pikepdf_engine = PikepdfEngine()
 
         if not self.pdf_path.exists():
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -117,7 +118,7 @@ class PDFCompressor:
 
     def compress(self, output_path: Union[str, Path]) -> CompressionResult:
         """
-        Compress PDF to target size.
+        Compress PDF to target size using hybrid engine approach.
 
         Args:
             output_path: Path for output PDF
@@ -130,7 +131,6 @@ class PDFCompressor:
 
         # If already under target, just copy
         if original_size <= self.target_size:
-            import shutil
             shutil.copy2(self.pdf_path, output_path)
             return CompressionResult(
                 success=True,
@@ -144,6 +144,7 @@ class PDFCompressor:
                 images_processed=0,
                 target_size=self.target_size,
                 target_achieved=True,
+                engine_used="none (already under target)",
             )
 
         self._report_progress(CompressionStage.ANALYZING, 0)
@@ -170,300 +171,178 @@ class PDFCompressor:
 
         self._report_progress(CompressionStage.ANALYZING, 100)
 
-        # Determine compression strategy based on PDF type
-        if analysis.pdf_type == "image-heavy":
-            return self._compress_image_heavy(output_path, analysis)
-        elif analysis.pdf_type == "text-heavy":
-            return self._compress_text_heavy(output_path, analysis)
+        # Strategy 1: Try Ghostscript first (if available and not disabled)
+        if self._should_try_ghostscript():
+            result = self._try_ghostscript(output_path, analysis)
+            if result and result.target_achieved:
+                return result
+            # Keep the result if it's the best we have so far
+            gs_result = result
         else:
-            return self._compress_mixed(output_path, analysis)
+            gs_result = None
 
-    def _compress_image_heavy(
+        # Strategy 2: Use optimized PyMuPDF
+        result = self._try_optimized_pymupdf(output_path, analysis)
+
+        # If Ghostscript was better, use that instead
+        if gs_result and gs_result.success:
+            if not result.success or gs_result.compressed_size < result.compressed_size:
+                # Re-run Ghostscript to final output
+                gs_final = self._try_ghostscript(output_path, analysis)
+                if gs_final:
+                    result = gs_final
+
+        # Strategy 3: Post-process with pikepdf if still above target
+        if result.success and result.compressed_size > self.target_size:
+            post_result = self._try_pikepdf_postprocess(output_path, result, analysis)
+            if post_result.compressed_size < result.compressed_size:
+                result = post_result
+
+        return result
+
+    def _should_try_ghostscript(self) -> bool:
+        """Determine if we should try Ghostscript."""
+        if self.prefer_engine == "pymupdf":
+            return False
+        return self._gs_engine.is_available()
+
+    def _try_ghostscript(
         self,
         output_path: Path,
         analysis: AnalysisResult
-    ) -> CompressionResult:
-        """Compress image-heavy PDF with focus on image optimization."""
-        config = self.tolerance_config[self.tolerance]
-        best_result = None
-        best_size = analysis.file_size
+    ) -> Optional[CompressionResult]:
+        """Try compression with Ghostscript."""
+        self._report_progress("Trying Ghostscript compression", 10)
 
-        iteration = 0
-        for quality in self.QUALITY_LEVELS:
-            if quality < config["min_quality"]:
-                break
+        engine_result = self._gs_engine.compress(
+            self.pdf_path,
+            output_path,
+            self.target_size,
+            self.tolerance,
+            self.progress_callback
+        )
 
-            for dpi in self.DPI_LEVELS:
-                if dpi < config["min_dpi"]:
-                    break
+        if not engine_result.success:
+            return None
 
-                iteration += 1
-                if iteration > config["max_iterations"]:
-                    break
-
-                progress = min(90, int((iteration / config["max_iterations"]) * 90))
-                self._report_progress(CompressionStage.PROCESSING_IMAGES, progress)
-
-                # Try compression with these settings
-                result = self._compress_with_settings(
-                    output_path, quality, dpi, analysis
-                )
-
-                if result.success:
-                    if result.compressed_size <= self.target_size:
-                        # Target achieved
-                        self._report_progress(CompressionStage.FINALIZING, 100)
-                        result.target_achieved = True
-                        result.iterations = iteration
-                        return result
-
-                    if result.compressed_size < best_size:
-                        best_result = result
-                        best_size = result.compressed_size
-
-            if iteration > config["max_iterations"]:
-                break
-
-        self._report_progress(CompressionStage.FINALIZING, 100)
-
-        # Return best result even if target not achieved
-        if best_result:
-            best_result.target_achieved = best_result.compressed_size <= self.target_size
-            return best_result
+        ratio = calculate_compression_ratio(analysis.file_size, engine_result.compressed_size)
 
         return CompressionResult(
-            success=False,
+            success=True,
             input_path=str(self.pdf_path),
             output_path=str(output_path),
             original_size=analysis.file_size,
-            compressed_size=analysis.file_size,
-            compression_ratio=0.0,
-            quality_estimate="N/A",
-            pages_processed=0,
-            images_processed=0,
+            compressed_size=engine_result.compressed_size,
+            compression_ratio=ratio,
+            quality_estimate=engine_result.quality_estimate,
+            pages_processed=analysis.page_count,
+            images_processed=analysis.image_count,
             target_size=self.target_size,
-            target_achieved=False,
-            error="Could not achieve target size",
+            target_achieved=engine_result.compressed_size <= self.target_size,
+            iterations=1,
+            engine_used="ghostscript",
         )
 
-    def _compress_text_heavy(
+    def _try_optimized_pymupdf(
         self,
         output_path: Path,
         analysis: AnalysisResult
     ) -> CompressionResult:
-        """Compress text-heavy PDF with focus on object optimization."""
-        self._report_progress(CompressionStage.OPTIMIZING_OBJECTS, 30)
+        """Compress using optimized PyMuPDF engine."""
+        self._report_progress("Using optimized PyMuPDF", 20)
 
-        # For text-heavy PDFs, focus on:
-        # - Metadata removal
-        # - Object deduplication
-        # - Stream compression
-        # - Font subsetting
+        engine_result = self._pymupdf_engine.compress(
+            self.pdf_path,
+            output_path,
+            self.target_size,
+            self.tolerance,
+            self.progress_callback
+        )
+
+        ratio = calculate_compression_ratio(analysis.file_size, engine_result.compressed_size)
+
+        return CompressionResult(
+            success=engine_result.success,
+            input_path=str(self.pdf_path),
+            output_path=str(output_path),
+            original_size=analysis.file_size,
+            compressed_size=engine_result.compressed_size,
+            compression_ratio=ratio,
+            quality_estimate=engine_result.quality_estimate,
+            pages_processed=analysis.page_count,
+            images_processed=analysis.image_count,
+            target_size=self.target_size,
+            target_achieved=engine_result.compressed_size <= self.target_size,
+            engine_used="pymupdf_optimized",
+            error=engine_result.error,
+        )
+
+    def _try_pikepdf_postprocess(
+        self,
+        output_path: Path,
+        previous_result: CompressionResult,
+        analysis: AnalysisResult
+    ) -> CompressionResult:
+        """Post-process with pikepdf for additional compression."""
+        self._report_progress("Post-processing with pikepdf", 90)
+
+        # Save current output to temp, then optimize to final path
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
 
         try:
-            doc = fitz.open(self.pdf_path)
+            # Copy current output to temp
+            shutil.copy2(output_path, tmp_path)
 
-            # Apply garbage collection and compression
-            doc.save(
-                output_path,
-                garbage=4,  # Maximum garbage collection
-                deflate=True,  # Compress streams
-                clean=True,  # Clean content streams
-                deflate_images=True,
-                deflate_fonts=True,
-            )
+            # Optimize with pikepdf
+            engine_result = self._pikepdf_engine.post_process(tmp_path, output_path)
 
-            compressed_size = output_path.stat().st_size
+            if engine_result.success and engine_result.compressed_size < previous_result.compressed_size:
+                ratio = calculate_compression_ratio(analysis.file_size, engine_result.compressed_size)
+                return CompressionResult(
+                    success=True,
+                    input_path=str(self.pdf_path),
+                    output_path=str(output_path),
+                    original_size=analysis.file_size,
+                    compressed_size=engine_result.compressed_size,
+                    compression_ratio=ratio,
+                    quality_estimate=previous_result.quality_estimate,
+                    pages_processed=analysis.page_count,
+                    images_processed=previous_result.images_processed,
+                    target_size=self.target_size,
+                    target_achieved=engine_result.compressed_size <= self.target_size,
+                    engine_used=f"{previous_result.engine_used}+pikepdf",
+                )
+        finally:
+            # Cleanup
+            if tmp_path.exists():
+                tmp_path.unlink()
 
-            self._report_progress(CompressionStage.FINALIZING, 100)
+        return previous_result
 
-            doc.close()
-
-            ratio = calculate_compression_ratio(analysis.file_size, compressed_size)
-            quality = estimate_quality_score(
-                analysis.file_size, compressed_size,
-                analysis.image_percentage, 90
-            )
-
-            return CompressionResult(
-                success=True,
-                input_path=str(self.pdf_path),
-                output_path=str(output_path),
-                original_size=analysis.file_size,
-                compressed_size=compressed_size,
-                compression_ratio=ratio,
-                quality_estimate=quality,
-                pages_processed=analysis.page_count,
-                images_processed=0,
-                target_size=self.target_size,
-                target_achieved=compressed_size <= self.target_size,
-            )
-
-        except Exception as e:
-            return CompressionResult(
-                success=False,
-                input_path=str(self.pdf_path),
-                output_path=str(output_path),
-                original_size=analysis.file_size,
-                compressed_size=analysis.file_size,
-                compression_ratio=0.0,
-                quality_estimate="N/A",
-                pages_processed=0,
-                images_processed=0,
-                target_size=self.target_size,
-                target_achieved=False,
-                error=str(e),
-            )
-
-    def _compress_mixed(
-        self,
-        output_path: Path,
-        analysis: AnalysisResult
-    ) -> CompressionResult:
-        """Compress mixed PDF with balanced approach."""
-        # Use image-heavy approach with slightly more conservative settings
-        return self._compress_image_heavy(output_path, analysis)
-
-    def _compress_with_settings(
-        self,
-        output_path: Path,
-        quality: int,
-        target_dpi: int,
-        analysis: AnalysisResult
-    ) -> CompressionResult:
+    @staticmethod
+    def get_available_engines() -> dict:
         """
-        Compress PDF with specific quality and DPI settings.
-
-        Args:
-            output_path: Output file path
-            quality: JPEG quality (1-100)
-            target_dpi: Target DPI for images
-            analysis: PDF analysis result
+        Get information about available compression engines.
 
         Returns:
-            CompressionResult
+            Dictionary with engine availability status
         """
-        try:
-            doc = fitz.open(self.pdf_path)
-            images_processed = 0
-
-            # Process each page
-            for page_num, page in enumerate(doc):
-                images = page.get_images(full=True)
-
-                for img in images:
-                    xref = img[0]
-
-                    try:
-                        # Extract and recompress image
-                        base_image = doc.extract_image(xref)
-                        if not base_image:
-                            continue
-
-                        image_bytes = base_image["image"]
-                        img_ext = base_image["ext"]
-
-                        # Load image with Pillow
-                        pil_image = Image.open(io.BytesIO(image_bytes))
-
-                        # Convert to RGB if necessary for JPEG
-                        if pil_image.mode in ("RGBA", "P", "LA"):
-                            # Create white background for transparency
-                            background = Image.new("RGB", pil_image.size, (255, 255, 255))
-                            if pil_image.mode == "P":
-                                pil_image = pil_image.convert("RGBA")
-                            if pil_image.mode in ("RGBA", "LA"):
-                                background.paste(pil_image, mask=pil_image.split()[-1])
-                                pil_image = background
-                            else:
-                                pil_image = pil_image.convert("RGB")
-                        elif pil_image.mode != "RGB":
-                            pil_image = pil_image.convert("RGB")
-
-                        # Calculate scaling based on DPI
-                        # Assume 72 DPI is the baseline
-                        current_dpi = 150  # Assume moderate source DPI
-                        scale = min(1.0, target_dpi / current_dpi)
-
-                        if scale < 1.0:
-                            new_size = (
-                                int(pil_image.width * scale),
-                                int(pil_image.height * scale)
-                            )
-                            if new_size[0] > 10 and new_size[1] > 10:
-                                pil_image = pil_image.resize(
-                                    new_size,
-                                    Image.Resampling.LANCZOS
-                                )
-
-                        # Compress to JPEG
-                        img_buffer = io.BytesIO()
-                        pil_image.save(
-                            img_buffer,
-                            format="JPEG",
-                            quality=quality,
-                            optimize=True
-                        )
-
-                        # Only replace if smaller
-                        new_image_bytes = img_buffer.getvalue()
-                        if len(new_image_bytes) < len(image_bytes):
-                            # Replace image in PDF
-                            page.replace_image(xref, stream=new_image_bytes)
-                            images_processed += 1
-
-                    except Exception:
-                        # Skip problematic images
-                        continue
-
-            # Save with optimization
-            doc.save(
-                output_path,
-                garbage=4,
-                deflate=True,
-                clean=True,
-                deflate_images=True,
-                deflate_fonts=True,
-            )
-
-            compressed_size = output_path.stat().st_size
-            doc.close()
-
-            ratio = calculate_compression_ratio(analysis.file_size, compressed_size)
-            quality_est = estimate_quality_score(
-                analysis.file_size, compressed_size,
-                analysis.image_percentage, quality
-            )
-
-            return CompressionResult(
-                success=True,
-                input_path=str(self.pdf_path),
-                output_path=str(output_path),
-                original_size=analysis.file_size,
-                compressed_size=compressed_size,
-                compression_ratio=ratio,
-                quality_estimate=quality_est,
-                pages_processed=analysis.page_count,
-                images_processed=images_processed,
-                target_size=self.target_size,
-                target_achieved=compressed_size <= self.target_size,
-            )
-
-        except Exception as e:
-            return CompressionResult(
-                success=False,
-                input_path=str(self.pdf_path),
-                output_path=str(output_path),
-                original_size=analysis.file_size,
-                compressed_size=analysis.file_size,
-                compression_ratio=0.0,
-                quality_estimate="N/A",
-                pages_processed=0,
-                images_processed=0,
-                target_size=self.target_size,
-                target_achieved=False,
-                error=str(e),
-            )
+        gs = GhostscriptEngine()
+        return {
+            "ghostscript": {
+                "available": gs.is_available(),
+                "description": "Fast external compression (requires Ghostscript installed)",
+            },
+            "pymupdf_optimized": {
+                "available": True,
+                "description": "Optimized PyMuPDF with image caching and parallel processing",
+            },
+            "pikepdf": {
+                "available": True,
+                "description": "PDF structure optimization (post-processor)",
+            },
+        }
 
 
 def compress_pdf(
@@ -472,6 +351,7 @@ def compress_pdf(
     target_size: int,
     tolerance: str = "balanced",
     progress_callback: Optional[Callable[[str, int], None]] = None,
+    prefer_engine: Optional[str] = None,
 ) -> CompressionResult:
     """
     Convenience function to compress a PDF.
@@ -482,11 +362,12 @@ def compress_pdf(
         target_size: Target size in bytes
         tolerance: "strict", "balanced", or "high_clarity"
         progress_callback: Optional progress callback
+        prefer_engine: Optional engine preference ("auto", "ghostscript", "pymupdf")
 
     Returns:
         CompressionResult
     """
     compressor = PDFCompressor(
-        input_path, target_size, tolerance, progress_callback
+        input_path, target_size, tolerance, progress_callback, prefer_engine
     )
     return compressor.compress(output_path)
